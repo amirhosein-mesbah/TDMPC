@@ -26,43 +26,107 @@ __REDUCE__ = lambda b: 'mean' if b else 'none'
 
 @dataclass
 class Args:
+    #----------------------------------------------------------------
+    # 1. Experiment Management
+    #----------------------------------------------------------------
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
+    """The name of this experiment."""
     seed: int = 1
-    """seed of the experiment"""
+    """The random seed for the experiment."""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = False
-    """if toggled, cuda will be enabled by default"""
+    """If toggled, `torch.backends.cudnn.deterministic=False`."""
+    cuda: bool = True
+    """If toggled, cuda will be enabled by default if available."""
     track: bool = False
-    """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
-    """the wandb's project name"""
+    """If toggled, this experiment will be tracked with Weights and Biases."""
+    wandb_project_name: str = "cleanRL-TDMPC"
+    """The W&B project name."""
     wandb_entity: str = None
-    """the entity (team) of wandb's project"""
+    """The entity (team) of the W&B project."""
     capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
-    
-    # Algorithm specific arguments
-    env_id: str = 'Meta-World/MT1'
-    """the id of the environment"""
-    env_name: str = 'reach-v3'
-    """name of the task for metaworld"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
-    total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
-    buffer_cap: int = 1000000
-    """capacity of replay buffer"""
+    """Whether to capture videos of the agent's performance."""
 
+    #----------------------------------------------------------------
+    # 2. Environment Setup
+    #----------------------------------------------------------------
+    env_id: str = 'Meta-World/MT1'
+    """The ID of the Meta-World environment suite."""
+    env_name: str = 'reach-v3'
+    """The name of the specific task in the Meta-World suite."""
+    num_envs: int = 1
+    """The number of parallel game environments (must be 1 for this implementation)."""
+    total_timesteps: int = 1000000
+    """Total number of environment steps to train for."""
+    action_repeat: int = 2
+    """The number of times to repeat each action in the environment, for computational efficiency and temporal abstraction."""
+    warmup_steps: int = 1000
+    """number of warm up states (before learning starts)"""
     
-    capture_video: bool = True
+    #----------------------------------------------------------------
+    # 3. Replay Buffer
+    #----------------------------------------------------------------
+    buffer_episode_capacity: int = 10000
+    """The maximum number of complete episodes to store in the replay buffer's main memory."""
+    buffer_transition_capacity: int = 1000000
+    """The maximum number of transitions to store in the SumTree for prioritized sampling. Should be >= total_timesteps."""
+
+    #----------------------------------------------------------------
+    # 4. Model Architecture
+    #----------------------------------------------------------------
+    latent_dim: int = 50
+    """The dimensionality of the latent state vector 'z' produced by the encoder."""
+    mlp_dim: int = 256
+    """The number of hidden units in each layer of the MLPs used for the model components."""
+
+    #----------------------------------------------------------------
+    # 5. Planning (Cross-Entropy Method)
+    #----------------------------------------------------------------
+    seed_steps: int = 5000
+    """Number of steps to take random actions at the beginning to seed the replay buffer with diverse data."""
+    horizon: int = 5
+    """The number of future steps the planner imagines and optimizes over."""
+    num_samples: int = 512
+    """The number of purely random action sequences to sample at each CEM iteration."""
+    num_elites: int = 64
+    """The number of top-performing action sequences to keep (the 'elites') for refining the search distribution."""
+    planning_optimization_iterations: int = 6
+    """The number of refinement iterations to run the CEM planner for at each time step."""
+    mixture_coef: float = 0.05
+    """The fraction of planner samples that are guided by the learned policy (exploitation) vs. being random (exploration)."""
+    temperature: float = 0.5
+    """Controls the 'softness' of the elite selection. Lower temperature = more greedy selection (only the very best matter)."""
+    momentum: float = 0.1
+    """The momentum coefficient for updating the CEM's mean. Smoothes the search distribution's shift between steps."""
+    min_std: float = 0.05
+    """Minimum standard deviation for the policy's action distribution to ensure exploration."""
+    std_schedule: str = 'linear(1.0, 0.1, 250000)'
+    """The schedule for the noise added to the final planned action, decaying over time."""
+    horizon_schedule: str = 'linear(5, 5, 250000)'
+    """A schedule to potentially increase the planning horizon over time (kept constant in the paper)."""
+    
+    #----------------------------------------------------------------
+    # 6. Training / Update
+    #----------------------------------------------------------------
+    batch_size: int = 256
+    """The number of sequences to sample from the replay buffer for each gradient update."""
+    lr: float = 1e-4
+    """The learning rate for the Adam optimizers."""
+    discount: float = 0.99
+    """The discount factor for future rewards (gamma) in the TD-target calculation."""
+    update_freq: int = 2
+    """How often to update the target network (in terms of agent steps)."""
+    tau: float = 0.01
+    """The coefficient for the soft target network update (EMA)."""
+    grad_clip_norm: float = 1000.0
+    """The maximum norm for gradients to prevent explosion during backpropagation."""
+    rho: float = 0.99
+    """The temporal discount factor for the multi-step losses. Gives more weight to predictions for earlier, more certain time-steps."""
+    consistency_coef: float = 1.0
+    """The weight for the latent state consistency loss in the total loss calculation."""
+    reward_coef: float = 1.0
+    """The weight for the reward prediction loss in the total loss calculation."""
+    value_coef: float = 1.0
+    """The weight for the Q-value (TD) loss in the total loss calculation."""
     
     
 class ActionRepeatWrapper(gym.Wrapper):
@@ -92,8 +156,8 @@ def make_env(env_id, env_name, idx, capture_video, run_name, action_repeat):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id, env_name=env_name)
-        env = ActionRepeatWrapper(env, action_repeat)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
+        if action_repeat > 1:
+            env = ActionRepeatWrapper(env, action_repeat)
         return env
 
     return thunk
@@ -142,11 +206,6 @@ def mse(pred, target, reduce=False):
 	"""Computes the MSE loss between predictions and targets."""
 	return F.mse_loss(pred, target, reduction=__REDUCE__(reduce))
 
-# Named tuple to represent a single transition.
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'done'))
-
-# A list of Transitions represents a full episode.
-Episode = List[Transition]
 
 class SumTree:
     def __init__(self, capacity):
@@ -202,15 +261,14 @@ class ReplayMemory:
     def __init__(self,  args: Args, device: Union[str, torch.device] = 'cpu'):
         self.device = torch.device(device)
         self.args = args
-        self.memory = deque([], maxlen=args.buffer_cap)
+        self.memory = deque([], maxlen=args.buffer_episode_capacity)
 
         # PER parameters
         self.per_alpha = 0.6 # How much prioritization to use (0=uniform, 1=fully prioritized)
         self.per_beta = 0.4 # Importance-sampling correction, anneals to 1.0
         self.beta_increment = (1.0 - self.per_beta) / args.total_timesteps
         self.max_priority = 1.0
-        self.tree_capacity = args.buffer_cap # Total transition capacity for the SumTree
-        self.tree = SumTree(self.tree_capacity)
+        self.tree = SumTree(args.buffer_transition_capacity)
 
         self._current_episode_data = []
         
@@ -347,19 +405,36 @@ class QNet(nn.Module):
         return self.net(x)
    
    
-class TruncatedNormal(torch.distributions.Normal):
-    def __init__(self, loc, scale, low=-1.0, high=1.0, clip=0.3):
-        super().__init__(loc, scale)
-        self.low = low
-        self.high = high
-        self.clip = clip
+   
+import torch.distributions as pyd
 
-    def sample(self, sample_shape=torch.Size()):
-        # Note: The original implementation has a clip parameter, which suggests
-        # they might be clipping the sample, not just the distribution range.
-        # This is a simplified version.
-        x = super().sample(sample_shape)
-        return torch.clamp(x, self.low + self.clip, self.high - self.clip)     
+# Helper function that was likely in the author's helper.py
+def _standard_normal(shape, dtype, device):
+    return torch.randn(shape, dtype=dtype, device=device)
+
+class TruncatedNormal(pyd.Normal):
+	"""Utility class implementing the truncated normal distribution."""
+	def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
+		super().__init__(loc, scale, validate_args=False)
+		self.low = low
+		self.high = high
+		self.eps = eps
+
+	def _clamp(self, x):
+		clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
+		x = x - x.detach() + clamped_x.detach()
+		return x
+
+	def sample(self, clip=None, sample_shape=torch.Size()):
+		shape = self._extended_shape(sample_shape)
+		eps = _standard_normal(shape,
+							   dtype=self.loc.dtype,
+							   device=self.loc.device)
+		eps *= self.scale
+		if clip is not None:
+			eps = torch.clamp(eps, -clip, clip)
+		x = self.loc + eps
+		return self._clamp(x)  
 
 
 class TDMPC(nn.Module):
@@ -379,26 +454,28 @@ class TDMPC(nn.Module):
         if len(obs_space.shape) == 3:
             print("Using CNN Encoder for pixel-based observations.")
             input_channels = obs_space.shape[0]
-            self._encoder = CNNEncoder(input_channels, args.encoder_hidden_dim, args.encoder_latent_dim)
+            self._encoder = CNNEncoder(input_channels, args.mlp_dim, args.latent_dim)
         else:
             print("Using MLP for vector-based encoder.")
             obs_dim = obs_space.shape[0]
-            self._encoder = MLP(obs_dim, self.args.mlp_hidden_dim, self.args.encoder_latent_dim)
+            self._encoder = MLP(obs_dim,  args.mlp_dim, args.latent_dim)
             
-        self._dynamics = MLP(args.encoder_latent_dim + action_dim, args.mlp_hidden_dim, args.encoder_latent_dim)
-        self._reward = MLP(args.encoder_latent_dim + action_dim, args.mlp_hidden_dim, 1)
-        self._pi = MLP(args.encoder_latent_dim, args.mlp_hidden_dim, args.action_dim)
-        self._Q1 = QNet(args.encoder_latent_dim, action_dim, args.mlp_hidden_dim)
-        self._Q2 = QNet(args.encoder_latent_dim, action_dim, args.mlp_hidden_dim)
+        self._dynamics = MLP( args.latent_dim + action_dim, args.mlp_dim,  args.latent_dim)
+        self._reward = MLP( args.latent_dim+ action_dim, args.mlp_dim, 1)
+        self._pi = MLP( args.latent_dim, args.mlp_dim, action_dim)
+        self._Q1 = QNet( args.latent_dim, action_dim, args.mlp_dim,)
+        self._Q2 = QNet( args.latent_dim, action_dim, args.mlp_dim,)
         
         # orthogonal initialization
         self.apply(orthogonal_init)
         
         self.apply(orthogonal_init)
-        for m in [self._reward, self._Q1, self._Q2]:
+        self._reward.net[-1].weight.data.fill_(0)
+        self._reward.net[-1].bias.data.fill_(0)
+        for m in [self._Q1, self._Q2]:
             # Access the last layer of the Sequential net inside the module
-            m.net[-1].weight.data.fill_(0)
-            m.net[-1].bias.data.fill_(0)
+            m.net.net[-1].weight.data.fill_(0)
+            m.net.net[-1].bias.data.fill_(0)
             
         # --- TD-MPC Algorithm Components ---
         self.model_target = deepcopy(self)
@@ -429,14 +506,17 @@ class TDMPC(nn.Module):
 
     def next(self, z, a):
         """Predicts next latent state (d) and single-step reward (R)."""
-        return self._dynamics(z, a), self._reward(z, a)
+        x = torch.cat([z, a], dim=-1)
+        return self._dynamics(x), self._reward(x)
     
     def pi(self, z, std=0):
         """Samples an action from the learned policy (pi)."""
         mu = torch.tanh(self._pi(z))
         if std > 0:
             std_tensor = torch.ones_like(mu) * std
-            return TruncatedNormal(mu, std_tensor).sample()
+            dist = TruncatedNormal(mu, std_tensor)
+            # This now correctly calls the reparameterized version!
+            return dist.sample()
         return mu
 
     def Q(self, z, a):
@@ -448,7 +528,6 @@ class TDMPC(nn.Module):
 if __name__=='__main__':
     
     args = tyro.cli(Args)
-    args.num_iterations = (args.total_steps + args.episode_length) // args.episode_length
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
@@ -485,10 +564,10 @@ if __name__=='__main__':
         [make_env(args.env_id, args.env_name, i, args.capture_video, run_name, args.action_repeat) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
-    action_dim = envs.single_action_space.shape[0][0]
+    action_dim = envs.single_action_space.shape[0]
     
     # define agent
-    agent = TDMPC(args, envs.observation_space, envs.action_space, device)
+    agent = TDMPC(args, envs.single_observation_space, envs.single_action_space, device)
     
     # define a replay buffer
     buffer = ReplayMemory(args, device)
@@ -497,7 +576,7 @@ if __name__=='__main__':
     global_step = 0
     start_time = time.time()
  
-    for iteration in range(1, args.num_iterations+1):
+    while global_step < args.total_timesteps:
         
         # collect trajectories
         obs, _ = envs.reset(seed=args.seed)
@@ -505,13 +584,14 @@ if __name__=='__main__':
         done  = False
         episode_len = 0
         prev_mean = None
+        cumulative_reward = 0
         while not done:
             with torch.no_grad():
                 if global_step < args.warmup_steps:
                     action = torch.empty(action_dim, dtype=torch.float32, device=device).uniform_(-1, 1)
                 else:
                     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    horizon = int(min(args.horizon, linear_schedule(args.horizon_schedule, global_step)))
+                    horizon = int(round(min(args.horizon, linear_schedule(args.horizon_schedule, global_step))))
                     num_pi_trajs = int(args.mixture_coef * args.num_samples) # what fraction of the search should be guided by the policy.
                     if num_pi_trajs > 0:
                         pi_actions = torch.empty(args.horizon, num_pi_trajs, action_dim, device=device)
@@ -525,7 +605,9 @@ if __name__=='__main__':
                     mean = torch.zeros(horizon, action_dim, device=device)
                     std = 2*torch.ones(horizon, action_dim, device=device)
                     if episode_len > 0 and prev_mean is not None:
-                        mean[:-1] = prev_mean[1:]
+                        len_to_copy = min(mean.shape[0], prev_mean.shape[0]) - 1
+                        if len_to_copy > 0:
+                            mean[:len_to_copy] = prev_mean[1 : 1 + len_to_copy]
                             
                     # Iterate CEM
                     for i in range(args.planning_optimization_iterations):
@@ -571,53 +653,61 @@ if __name__=='__main__':
             obs = next_obs[0]
             global_step += 1
             episode_len += 1
+            cumulative_reward += rewards[0]
             
         print(f"global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}")
+        writer.add_scalar("charts/episode_reward", cumulative_reward, global_step)
+        writer.add_scalar("charts/episode_length", episode_len, global_step)
         
         # Update Modelp
         if global_step >= args.warmup_steps:
-            num_updates = args.warmup_steps if global_step == args.warmup_steps else args.episode_length
-            for i in range(num_updates):
-                obs, actions, rewards, next_obses, tree_indices, weights =  sample_data = buffer.sample(args.batch_size)
+            for i in range(episode_len):
+                obs, actions, rewards, next_obses, idx, weights =  sample_data = buffer.sample(args.batch_size) # what are the shape of samples?
                 agent.optim.zero_grad(set_to_none=True)
                 std = linear_schedule(args.std_schedule, global_step)
-                agent.train()
+                agent.train() # considering agent class, is this true?
 
                 # Representation
-                z = agent.h(obs)
-                zs = [z.detach()]
+                z = agent.h(obs) 
+                zs_for_pi = [z.detach()]
 
                 consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0
                 for t in range(args.horizon):
                     # Predictions
-                    Q1, Q2 = agent.Q(z, action[t])
-                    z, reward_pred = agent.next(z, action[t])
+                    Q1, Q2 = agent.Q(z, actions[t])
+                    z_pred, reward_pred = agent.next(z, actions[t])
                     with torch.no_grad():
                         next_obs = next_obses[t]
-                        next_z = agent.model_target.h(next_obs)
+                        next_z_target = agent.model_target.h(next_obs)
                         next_z = agent.h(next_obs)
-                        td_target = reward + args.discount * torch.min(*agent.model_target.Q(next_z, agent.pi(next_z, args.min_std)))
+                        td_target = rewards[t] + args.discount * torch.min(*agent.model_target.Q(next_z, agent.pi(next_z, args.min_std)))
                 
-                    zs.append(z.detach())
+                    
 
                     # Losses
                     rho = (args.rho ** t)
-                    consistency_loss += rho * torch.mean(mse(z, next_z), dim=1, keepdim=True)
-                    reward_loss += rho * mse(reward_pred, reward[t])
+                    consistency_loss += rho * torch.mean(mse(z_pred, next_z_target), dim=1, keepdim=True)
+                    reward_loss += rho * mse(reward_pred, rewards[t])
                     value_loss += rho * (mse(Q1, td_target) + mse(Q2, td_target))
                     priority_loss += rho * (l1(Q1, td_target) + l1(Q2, td_target))
                     
-                
+
+                    z = z_pred
+                    zs_for_pi.append(z.detach())
+                    
                 # Optimize model
                 total_loss = args.consistency_coef * consistency_loss.clamp(max=1e4) + \
                             args.reward_coef * reward_loss.clamp(max=1e4) + \
                             args.value_coef * value_loss.clamp(max=1e4)
-                weighted_loss = (total_loss.squeeze(1) * weights).mean()
+                weighted_loss = (total_loss * weights).mean()
                 weighted_loss.register_hook(lambda grad: grad * (1/args.horizon))
                 weighted_loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), args.grad_clip_norm, error_if_nonfinite=False)
+                
+                model_params = list(agent._encoder.parameters()) + list(agent._dynamics.parameters()) + \
+               list(agent._reward.parameters()) + list(agent._Q1.parameters()) + list(agent._Q2.parameters())
+                grad_norm = torch.nn.utils.clip_grad_norm_(model_params, args.grad_clip_norm, error_if_nonfinite=False) # is usign agent.parameters correct? for clipping the gradients
                 agent.optim.step()
-                buffer.update_priorities(tree_indices, priority_loss.clamp(max=1e4).detach())
+                buffer.update_priorities(idx, priority_loss.clamp(max=1e4).detach())
                 
                 
                 # Update policy + target network
@@ -626,48 +716,39 @@ if __name__=='__main__':
 
                 # Loss is a weighted sum of Q-values
                 pi_loss = 0
-                for t,z in enumerate(zs):
-                    a = agent.pi(z, args.min_std)
-                    Q = torch.min(*agent.Q(z, a))
+                for t, z_pi in enumerate(zs_for_pi):
+                    a = agent.pi(z_pi, args.min_std)
+                    Q = torch.min(*agent.Q(z_pi, a))
                     pi_loss += -Q.mean() * (args.rho ** t)
 
+                # print(pi_loss.item())
                 pi_loss.backward()
-                torch.nn.utils.clip_grad_norm_(agent._pi.parameters(), args.grad_clip_norm, error_if_nonfinite=False)
+                torch.nn.utils.clip_grad_norm_(agent._pi.parameters(), args.grad_clip_norm)
                 agent.pi_optim.step()
                 agent.track_q_grad(True)
+                
                 if global_step % args.update_freq == 0:
                     with torch.no_grad():
                         for p, p_target in zip(agent.parameters(), agent.model_target.parameters()):
                             p_target.data.lerp_(p.data, args.tau)
 
+
                 agent.eval()
-                writer.add_scalar("losses/value_loss", float(value_loss.mean().item()), global_step)
-                writer.add_scalar("losses/policy_loss", pi_loss.item(), global_step)
-                writer.add_scalar("losses/consistency_loss", float(consistency_loss.mean().item()), global_step)
-                writer.add_scalar("losses/total_loss", float(total_loss.mean().item()), global_step)
-                writer.add_scalar("losses/weighted_loss", float(weighted_loss.mean().item()), global_step)
-                writer.add_scalar("losses/reward_loss", float(reward_loss.mean().item()), global_step)
-                writer.add_scalar("charts/grad_norm", float(grad_norm), global_step)
                 
-            
-        # Logging
-        episode_idx += 1
-		env_step = int(global_step*args.action_repeat)
-        
-        
-        # # Eval Agent
-        # if global_step % args.eval_freq == 0:
-        #     """Evaluate a trained agent and optionally save a video."""
-	    #     episode_rewards = []
-	    #     for i in range(num_episodes):
-		#     obs, _,  done, ep_reward, t = envs.reset(), False, 0, 0
-		#     if video: video.init(env, enabled=(i==0))
-		# while not done:
-		# 	action = agent.plan(obs, eval_mode=True, step=step, t0=t==0)
-		# 	obs, reward, done, _ = env.step(action.cpu().numpy())
-		# 	ep_reward += reward
-		# 	if video: video.record(env)
-		# 	t += 1
-		# episode_rewards.append(ep_reward)
+            writer.add_scalar("losses/value_loss", float(value_loss.mean().item()), global_step)
+            writer.add_scalar("losses/policy_loss", pi_loss.item(), global_step)
+            writer.add_scalar("losses/consistency_loss", float(consistency_loss.mean().item()), global_step)
+            writer.add_scalar("losses/total_loss", float(total_loss.mean().item()), global_step)
+            writer.add_scalar("losses/weighted_loss", float(weighted_loss.mean().item()), global_step)
+            writer.add_scalar("losses/reward_loss", float(reward_loss.mean().item()), global_step)
+            writer.add_scalar("charts/grad_norm", float(grad_norm), global_step)
+                
+
+
+    # --- Final Cleanup ---  
+    envs.close()
+    writer.close()
+    if args.track:
+        wandb.finish()
         
         
