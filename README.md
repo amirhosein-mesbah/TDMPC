@@ -2,6 +2,8 @@
 
 A CleanRL-style implementation of TDMPC (Temporal Difference Learning for Model Predictive Control), a model-based reinforcement learning algorithm that combines learned world models with online planning for continuous control tasks.
 
+> **Note**: This is an educational/research implementation intended for learning and experimentation. It is not the official TDMPC implementation.
+
 ## Overview
 
 TDMPC learns a latent dynamics model of the environment and uses it for planning via the Cross-Entropy Method (CEM). The algorithm trains the following components end-to-end:
