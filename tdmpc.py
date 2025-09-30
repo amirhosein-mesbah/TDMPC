@@ -6,28 +6,27 @@ from collections import deque, namedtuple
 from typing import List, Union
 from copy import deepcopy
 import operator
+import tyro
+import re
+
 
 
 import gymnasium as gym
 import metaworld
 
 import numpy as np
-import re
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import tyro
-from torch.distributions.categorical import Categorical
+import torch.distributions as pyd
 from torch.utils.tensorboard import SummaryWriter
-
-__REDUCE__ = lambda b: 'mean' if b else 'none'
 
 
 @dataclass
 class Args:
     #----------------------------------------------------------------
-    # 1. Experiment Management
+    #                   Experiment Management
     #----------------------------------------------------------------
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """The name of this experiment."""
@@ -35,8 +34,8 @@ class Args:
     """The random seed for the experiment."""
     torch_deterministic: bool = True
     """If toggled, `torch.backends.cudnn.deterministic=False`."""
-    cuda: bool = True
-    """If toggled, cuda will be enabled by default if available."""
+    cuda: bool = False
+    """If toggled, cuda will not be enabled by default if available."""
     track: bool = False
     """If toggled, this experiment will be tracked with Weights and Biases."""
     wandb_project_name: str = "cleanRL-TDMPC"
@@ -47,7 +46,7 @@ class Args:
     """Whether to capture videos of the agent's performance."""
 
     #----------------------------------------------------------------
-    # 2. Environment Setup
+    #                     Environment Setup
     #----------------------------------------------------------------
     env_id: str = 'Meta-World/MT1'
     """The ID of the Meta-World environment suite."""
@@ -59,11 +58,9 @@ class Args:
     """Total number of environment steps to train for."""
     action_repeat: int = 2
     """The number of times to repeat each action in the environment, for computational efficiency and temporal abstraction."""
-    warmup_steps: int = 1000
-    """number of warm up states (before learning starts)"""
     
     #----------------------------------------------------------------
-    # 3. Replay Buffer
+    #                       Replay Buffer
     #----------------------------------------------------------------
     buffer_episode_capacity: int = 10000
     """The maximum number of complete episodes to store in the replay buffer's main memory."""
@@ -71,7 +68,7 @@ class Args:
     """The maximum number of transitions to store in the SumTree for prioritized sampling. Should be >= total_timesteps."""
 
     #----------------------------------------------------------------
-    # 4. Model Architecture
+    #                      Model Architecture
     #----------------------------------------------------------------
     latent_dim: int = 50
     """The dimensionality of the latent state vector 'z' produced by the encoder."""
@@ -79,9 +76,9 @@ class Args:
     """The number of hidden units in each layer of the MLPs used for the model components."""
 
     #----------------------------------------------------------------
-    # 5. Planning (Cross-Entropy Method)
+    #                        Planning (CEM)
     #----------------------------------------------------------------
-    seed_steps: int = 5000
+    warmup_steps: int = 1000
     """Number of steps to take random actions at the beginning to seed the replay buffer with diverse data."""
     horizon: int = 5
     """The number of future steps the planner imagines and optimizes over."""
@@ -105,7 +102,7 @@ class Args:
     """A schedule to potentially increase the planning horizon over time (kept constant in the paper)."""
     
     #----------------------------------------------------------------
-    # 6. Training / Update
+    #                       Training / Update
     #----------------------------------------------------------------
     batch_size: int = 256
     """The number of sequences to sample from the replay buffer for each gradient update."""
@@ -129,6 +126,7 @@ class Args:
     """The weight for the Q-value (TD) loss in the total loss calculation."""
     
     
+# Environment Setup
 class ActionRepeatWrapper(gym.Wrapper):
     def __init__(self, env: gym.Env, amount: int):
         super().__init__(env)
@@ -162,6 +160,7 @@ def make_env(env_id, env_name, idx, capture_video, run_name, action_repeat):
 
     return thunk
 
+# Helper Functions
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -196,6 +195,7 @@ def linear_schedule(schdl, step):
 	raise NotImplementedError(schdl)
 
 
+__REDUCE__ = lambda b: 'mean' if b else 'none'
 
 def l1(pred, target, reduce=False):
 	"""Computes the L1-loss between predictions and targets."""
@@ -207,6 +207,7 @@ def mse(pred, target, reduce=False):
 	return F.mse_loss(pred, target, reduction=__REDUCE__(reduce))
 
 
+# prioritized replay buffer
 class SumTree:
     def __init__(self, capacity):
         self.capacity = capacity
@@ -254,18 +255,14 @@ class SumTree:
 
 
 class ReplayMemory:
-    """
-    An episodic replay memory with Prioritized Experience Replay (PER).
-    This buffer stores full episodes but samples fixed-length sequences based on priority.
-    """
     def __init__(self,  args: Args, device: Union[str, torch.device] = 'cpu'):
         self.device = torch.device(device)
         self.args = args
         self.memory = deque([], maxlen=args.buffer_episode_capacity)
 
         # PER parameters
-        self.per_alpha = 0.6 # How much prioritization to use (0=uniform, 1=fully prioritized)
-        self.per_beta = 0.4 # Importance-sampling correction, anneals to 1.0
+        self.per_alpha = 0.6 
+        self.per_beta = 0.4 
         self.beta_increment = (1.0 - self.per_beta) / args.total_timesteps
         self.max_priority = 1.0
         self.tree = SumTree(args.buffer_transition_capacity)
@@ -273,23 +270,17 @@ class ReplayMemory:
         self._current_episode_data = []
         
     def add(self, state, action, reward, next_state, done):
-        """Adds a single transition and commits the episode when done."""
-        # Store transition data temporarily
         self._current_episode_data.append((state, action, reward, next_state, done))
 
         if done:
             episode = self._current_episode_data
             self.memory.append(episode)
             self._current_episode_data = []
-
-            # Add all valid sequence starting points from this episode to the SumTree
             for i in range(len(episode) - self.args.horizon + 1):
-                # The data stored in the tree is a pointer to the episode and the start index
                 pointer = (len(self.memory) - 1, i) 
                 self.tree.add(self.max_priority, pointer)
                 
     def update_priorities(self, tree_indices, priorities):
-        """Update priorities of sampled transitions."""
         priorities = priorities.detach().cpu().numpy().flatten()
         for idx, priority in zip(tree_indices, priorities):
             self.tree.update(idx, priority)
@@ -297,11 +288,9 @@ class ReplayMemory:
             
 
     def sample(self, batch_size: int):
-        """Samples a batch of sequences using priorities."""
         if self.tree.n_entries < batch_size:
             return None
 
-        # Sample from the SumTree
         batch_indices, batch_priorities, batch_pointers = [], [], []
         segment = self.tree.total_priority / batch_size
         self.per_beta = min(1.0, self.per_beta + self.beta_increment)
@@ -313,13 +302,12 @@ class ReplayMemory:
             batch_priorities.append(p)
             batch_pointers.append(data)
 
-        # Calculate importance-sampling weights
+
         sampling_probabilities = np.array(batch_priorities) / self.tree.total_priority
         weights = np.power(self.tree.n_entries * sampling_probabilities, -self.per_beta)
         weights /= weights.max()
         weights = torch.tensor(weights, dtype=torch.float32, device=self.device).unsqueeze(1)
 
-        # Retrieve and format the sequences
         start_obs_batch, action_batch, reward_batch, next_obs_batch = [], [], [], []
         for ep_idx, start_idx in batch_pointers:
             episode = self.memory[ep_idx]
@@ -327,13 +315,12 @@ class ReplayMemory:
             
             states, actions, rewards, next_states, _ = zip(*sequence_data)
 
-            # Convert to tensors here
             start_obs_batch.append(torch.from_numpy(states[0]).to(self.device))
             action_batch.append(torch.from_numpy(np.array(actions)).to(self.device))
             reward_batch.append(torch.from_numpy(np.array(rewards)).to(self.device))
             next_obs_batch.append(torch.from_numpy(np.array(next_states)).to(self.device))
 
-        # Stack and permute to match paper's expected format [H, B, dim]
+        # shape [H, B, dim]
         return (
             torch.stack(start_obs_batch).float(),
             torch.stack(action_batch).permute(1, 0, 2).float(),
@@ -344,10 +331,10 @@ class ReplayMemory:
         )
 
     def __len__(self) -> int:
-        return len(self.memory) # Number of episodes
+        return len(self.memory)
 
 
-
+# Helper classes and functions to implement TOLD and TDMPC
 class MLP(nn.Module):
     def __init__(self, mlp_input_dim, mlp_hidden_dim, mlp_output_dim):
         super().__init__()
@@ -361,39 +348,6 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
     
-class CNNEncoder(nn.Module):
-    def __init__(self, input_channels, encoder_hidden_dim, encoder_latent_dim):
-        super().__init__()
-        self.conv_net = nn.Sequential(
-            # Input shape: [N, C, 84, 84]
-            nn.Conv2d(input_channels, 32, kernel_size=8, stride=4, padding=0),
-            nn.ReLU(),
-            # Shape: [N, 32, 20, 20]
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
-            nn.ReLU(),
-            # Shape: [N, 64, 9, 9]
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
-            nn.ReLU(),
-            # Shape: [N, 64, 7, 7]
-            nn.Flatten(),
-        )
-        
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, input_channels, 84, 84)
-            flattened_size = self.conv_net(dummy_input).shape[1]
-        
-        self.fc_net = nn.Sequential(
-            nn.Linear(flattened_size, encoder_hidden_dim),
-            nn.ReLU(),
-            nn.Linear(encoder_hidden_dim, encoder_latent_dim),
-        )
-    
-    def forward(self, obs):
-        conv_out = self.conv_net(obs)
-        latent_vector = self.fc_net(conv_out)
-        return latent_vector
-    
-    
     
 class QNet(nn.Module):
     def __init__(self, latent_dim, action_dim, mlp_hidden_dim):
@@ -404,16 +358,11 @@ class QNet(nn.Module):
         x = torch.cat([z, a], dim=-1)
         return self.net(x)
    
-   
-   
-import torch.distributions as pyd
 
-# Helper function that was likely in the author's helper.py
 def _standard_normal(shape, dtype, device):
     return torch.randn(shape, dtype=dtype, device=device)
 
 class TruncatedNormal(pyd.Normal):
-	"""Utility class implementing the truncated normal distribution."""
 	def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
 		super().__init__(loc, scale, validate_args=False)
 		self.low = low
@@ -438,26 +387,18 @@ class TruncatedNormal(pyd.Normal):
 
 
 class TDMPC(nn.Module):
-    """
-    The integrated TD-MPC agent, combining the TOLD model and the planning/update logic.
-    """
     def __init__(self, args: Args, obs_space, action_space, device):
         super().__init__()
         self.args = args
         self.device = device
         
-        # Automatically set action_dim from the environment
         action_dim = action_space.shape[0]
         obs_dim = obs_space.shape[0]
         
         # TOLD world model
         if len(obs_space.shape) == 3:
-            print("Using CNN Encoder for pixel-based observations.")
-            input_channels = obs_space.shape[0]
-            self._encoder = CNNEncoder(input_channels, args.mlp_dim, args.latent_dim)
+            raise NotImplementedError("CNN Encoder not implemented, this script is not for pixel based environments!") 
         else:
-            print("Using MLP for vector-based encoder.")
-            obs_dim = obs_space.shape[0]
             self._encoder = MLP(obs_dim,  args.mlp_dim, args.latent_dim)
             
         self._dynamics = MLP( args.latent_dim + action_dim, args.mlp_dim,  args.latent_dim)
@@ -473,22 +414,16 @@ class TDMPC(nn.Module):
         self._reward.net[-1].weight.data.fill_(0)
         self._reward.net[-1].bias.data.fill_(0)
         for m in [self._Q1, self._Q2]:
-            # Access the last layer of the Sequential net inside the module
             m.net.net[-1].weight.data.fill_(0)
             m.net.net[-1].bias.data.fill_(0)
             
-        # --- TD-MPC Algorithm Components ---
         self.model_target = deepcopy(self)
         
         # Optimizers
         model_params = list(self._encoder.parameters()) + list(self._dynamics.parameters()) + \
                        list(self._reward.parameters()) + list(self._Q1.parameters()) + list(self._Q2.parameters())
-        self.optim = torch.optim.Adam(model_params, lr=self.args.lr)
-        self.pi_optim = torch.optim.Adam(self._pi.parameters(), lr=self.args.lr)
-        
-        
-        # Planner state
-        self._prev_mean = None
+        self.optim = optim.Adam(model_params, lr=self.args.lr)
+        self.pi_optim = optim.Adam(self._pi.parameters(), lr=self.args.lr)
         
         self.to(self.device)
         self.model_target.to(self.device)
@@ -515,7 +450,6 @@ class TDMPC(nn.Module):
         if std > 0:
             std_tensor = torch.ones_like(mu) * std
             dist = TruncatedNormal(mu, std_tensor)
-            # This now correctly calls the reparameterized version!
             return dist.sample()
         return mu
 
@@ -525,11 +459,10 @@ class TDMPC(nn.Module):
 
     
 
+
 if __name__=='__main__':
-    
     args = tyro.cli(Args)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
 
     if args.track:
@@ -559,26 +492,24 @@ if __name__=='__main__':
     
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup observation space (1, 39) - action space (1, 4)
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.env_name, i, args.capture_video, run_name, args.action_repeat) for i in range(args.num_envs)],
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
     action_dim = envs.single_action_space.shape[0]
     
-    # define agent
     agent = TDMPC(args, envs.single_observation_space, envs.single_action_space, device)
     
-    # define a replay buffer
+
     buffer = ReplayMemory(args, device)
     
-    # TRY NOT TO MODIFY: start the game
+    # TRY NOT TO MODIFY:
     global_step = 0
     start_time = time.time()
  
     while global_step < args.total_timesteps:
         
-        # collect trajectories
+        # collect trajectories with planning
         obs, _ = envs.reset(seed=args.seed)
         obs = obs[0]
         done  = False
@@ -587,12 +518,18 @@ if __name__=='__main__':
         cumulative_reward = 0
         while not done:
             with torch.no_grad():
+                # if agent was in the warm-up stage take fully random actions
                 if global_step < args.warmup_steps:
                     action = torch.empty(action_dim, dtype=torch.float32, device=device).uniform_(-1, 1)
+                # else select actions with planning
+                # sample sequences of actions (with the length of horizon), some of are sample regarding the learned policy
+                # evaluate sequences and select top k sequences
+                # update the parameters based on top k
+                # step action in the environment and save the transition in buffer
                 else:
                     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                     horizon = int(round(min(args.horizon, linear_schedule(args.horizon_schedule, global_step))))
-                    num_pi_trajs = int(args.mixture_coef * args.num_samples) # what fraction of the search should be guided by the policy.
+                    num_pi_trajs = int(args.mixture_coef * args.num_samples) 
                     if num_pi_trajs > 0:
                         pi_actions = torch.empty(args.horizon, num_pi_trajs, action_dim, device=device)
                         z = agent.h(obs_tensor).repeat(num_pi_trajs, 1)
@@ -600,7 +537,7 @@ if __name__=='__main__':
                             pi_actions[t] = agent.pi(z, args.min_std)
                             z, _ = agent.next(z, pi_actions[t])
                         
-                    # Initialize state and parameters
+
                     z_cem_start = agent.h(obs_tensor).repeat(args.num_samples+num_pi_trajs, 1)
                     mean = torch.zeros(horizon, action_dim, device=device)
                     std = 2*torch.ones(horizon, action_dim, device=device)
@@ -637,15 +574,14 @@ if __name__=='__main__':
                         _std = _std.clamp_(linear_schedule(args.std_schedule, global_step), 2)
                         mean, std = args.momentum * mean + (1 - args.momentum) * _mean, _std
                         
-                    # Outputs
+
                     score = score.squeeze(1).cpu().numpy()
                     actions = elite_actions[:, np.random.choice(np.arange(score.shape[0]), p=score)]
                     prev_mean = mean
                     action = actions[0]
                     action = torch.clamp(action + std[0] * torch.randn(action_dim, device=device), -1, 1)
-                    
-                # is_first_step = (episode_len == 0)
-                # action = agent.plan(obs, step = iteration, t0 = is_first_step)
+            
+            # apply action to the env
             next_obs, rewards, terminations, truncations, infos = envs.step(actions=[action.cpu().numpy()])
             
             done = terminations[0] or truncations[0]
@@ -655,25 +591,26 @@ if __name__=='__main__':
             episode_len += 1
             cumulative_reward += rewards[0]
             
-        print(f"global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}")
+        print(f"global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}, cumulative reward={cumulative_reward}")
         writer.add_scalar("charts/episode_reward", cumulative_reward, global_step)
         writer.add_scalar("charts/episode_length", episode_len, global_step)
         
-        # Update Modelp
+        # Update TOLD Model
+        # sample from buffer
+        # calculate the loss and update the TOLD model components
+        # update the policy net with its own objective
         if global_step >= args.warmup_steps:
             for i in range(episode_len):
-                obs, actions, rewards, next_obses, idx, weights =  sample_data = buffer.sample(args.batch_size) # what are the shape of samples?
+                obs, actions, rewards, next_obses, idx, weights =  sample_data = buffer.sample(args.batch_size)
                 agent.optim.zero_grad(set_to_none=True)
                 std = linear_schedule(args.std_schedule, global_step)
-                agent.train() # considering agent class, is this true?
+                agent.train()
 
-                # Representation
                 z = agent.h(obs) 
                 zs_for_pi = [z.detach()]
 
                 consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0
                 for t in range(args.horizon):
-                    # Predictions
                     Q1, Q2 = agent.Q(z, actions[t])
                     z_pred, reward_pred = agent.next(z, actions[t])
                     with torch.no_grad():
@@ -682,15 +619,13 @@ if __name__=='__main__':
                         next_z = agent.h(next_obs)
                         td_target = rewards[t] + args.discount * torch.min(*agent.model_target.Q(next_z, agent.pi(next_z, args.min_std)))
                 
-                    
-
+    
                     # Losses
                     rho = (args.rho ** t)
                     consistency_loss += rho * torch.mean(mse(z_pred, next_z_target), dim=1, keepdim=True)
                     reward_loss += rho * mse(reward_pred, rewards[t])
                     value_loss += rho * (mse(Q1, td_target) + mse(Q2, td_target))
                     priority_loss += rho * (l1(Q1, td_target) + l1(Q2, td_target))
-                    
 
                     z = z_pred
                     zs_for_pi.append(z.detach())
@@ -705,23 +640,21 @@ if __name__=='__main__':
                 
                 model_params = list(agent._encoder.parameters()) + list(agent._dynamics.parameters()) + \
                list(agent._reward.parameters()) + list(agent._Q1.parameters()) + list(agent._Q2.parameters())
-                grad_norm = torch.nn.utils.clip_grad_norm_(model_params, args.grad_clip_norm, error_if_nonfinite=False) # is usign agent.parameters correct? for clipping the gradients
+                grad_norm = torch.nn.utils.clip_grad_norm_(model_params, args.grad_clip_norm, error_if_nonfinite=False) 
                 agent.optim.step()
                 buffer.update_priorities(idx, priority_loss.clamp(max=1e4).detach())
                 
                 
-                # Update policy + target network
+                # Update policy network
                 agent.pi_optim.zero_grad(set_to_none=True)
                 agent.track_q_grad(False)
 
-                # Loss is a weighted sum of Q-values
                 pi_loss = 0
                 for t, z_pi in enumerate(zs_for_pi):
                     a = agent.pi(z_pi, args.min_std)
                     Q = torch.min(*agent.Q(z_pi, a))
                     pi_loss += -Q.mean() * (args.rho ** t)
 
-                # print(pi_loss.item())
                 pi_loss.backward()
                 torch.nn.utils.clip_grad_norm_(agent._pi.parameters(), args.grad_clip_norm)
                 agent.pi_optim.step()
@@ -742,13 +675,9 @@ if __name__=='__main__':
             writer.add_scalar("losses/weighted_loss", float(weighted_loss.mean().item()), global_step)
             writer.add_scalar("losses/reward_loss", float(reward_loss.mean().item()), global_step)
             writer.add_scalar("charts/grad_norm", float(grad_norm), global_step)
-                
 
-
-    # --- Final Cleanup ---  
+ 
     envs.close()
     writer.close()
     if args.track:
         wandb.finish()
-        
-        
