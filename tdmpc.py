@@ -462,7 +462,7 @@ class TDMPC(nn.Module):
 
 if __name__=='__main__':
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{args.env_name}__{args.exp_name}__{args.seed}__{int(time.time())}"
     assert args.num_envs == 1, "vectorized envs are not supported at the moment"
 
     if args.track:
@@ -505,6 +505,9 @@ if __name__=='__main__':
     
     # TRY NOT TO MODIFY:
     global_step = 0
+    success_rate = 0.0
+    episode_count = 0.0
+    current_rate = 0.0
     start_time = time.time()
  
     while global_step < args.total_timesteps:
@@ -590,10 +593,17 @@ if __name__=='__main__':
             global_step += 1
             episode_len += 1
             cumulative_reward += rewards[0]
-            
-        print(f"global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}, cumulative reward={cumulative_reward}")
+        
+        # Logging episode stats
+        episode_count += 1
+        if infos["success"][0] == 1:
+               success_rate += 1  
+        current_rate = success_rate/episode_count
+        print(f"ep= {episode_count} global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}, cumulative reward={cumulative_reward}, success_rate={current_rate}")
         writer.add_scalar("charts/episode_reward", cumulative_reward, global_step)
         writer.add_scalar("charts/episode_length", episode_len, global_step)
+        writer.add_scalar("charts/success_rate", current_rate, global_step)
+        
         
         # Update TOLD Model
         # sample from buffer

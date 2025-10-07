@@ -55,6 +55,17 @@ python tdmpc.py --capture-video
 
 Supported Meta-World tasks include: `reach-v3`, `push-v3`, `pick-place-v3`, `door-open-v3`, `drawer-open-v3`, `window-open-v3`, `button-press-v3`, and others from the Meta-World MT1 benchmark.
 
+## TODO
+
+Potential future improvements and extensions:
+
+- [ ] Add support for vectorized environments (num_envs > 1)
+- [ ] Add support for DeepMind Control Suite environments
+- [ ] Implement CNN encoder for pixel-based observations
+- [ ] Add experimental results and training curves
+- [ ] Add model checkpoint saving/loading
+- [ ] Add evaluation mode without exploration noise
+
 ## Code Structure
 
 ```
