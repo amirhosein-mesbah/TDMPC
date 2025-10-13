@@ -50,7 +50,7 @@ class Args:
     #----------------------------------------------------------------
     env_id: str = 'Meta-World/MT1'
     """The ID of the Meta-World environment suite."""
-    env_name: str = 'door-lock-v3'
+    env_name: str = 'door-close-v3'
     """The name of the specific task in the Meta-World suite."""
     num_envs: int = 1
     """The number of parallel game environments (must be 1 for this implementation)."""
