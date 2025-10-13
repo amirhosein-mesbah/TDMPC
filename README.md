@@ -60,7 +60,7 @@ The following plots show the average success rate across training for two Meta-W
 
 | door-lock-v3 | door-close-v3 |
 |:---:|:---:|
-| ![door-lock-v3 success rate](media\door_lock_success_rate.jpg) | ![door-close-v3 success rate](media\door_close_success_rate.jpg) |
+| ![door-lock-v3 success rate](/media/door_lock_success_rate.jpg) | ![door-close-v3 success rate](/media/door_close_success_rate.jpg) |
 
 
 
