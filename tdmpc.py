@@ -50,13 +50,13 @@ class Args:
     #----------------------------------------------------------------
     env_id: str = 'Meta-World/MT1'
     """The ID of the Meta-World environment suite."""
-    env_name: str = 'reach-v3'
+    env_name: str = 'door-lock-v3'
     """The name of the specific task in the Meta-World suite."""
     num_envs: int = 1
     """The number of parallel game environments (must be 1 for this implementation)."""
     total_timesteps: int = 1000000
     """Total number of environment steps to train for."""
-    action_repeat: int = 2
+    action_repeat: int = 1
     """The number of times to repeat each action in the environment, for computational efficiency and temporal abstraction."""
     
     #----------------------------------------------------------------
@@ -150,10 +150,10 @@ class ActionRepeatWrapper(gym.Wrapper):
 def make_env(env_id, env_name, idx, capture_video, run_name, action_repeat):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, env_name=env_name, render_mode="rgb_array")
+            env = gym.make(env_id, env_name=env_name, render_mode="rgb_array", max_episode_steps= int(1000/action_repeat))
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
-            env = gym.make(env_id, env_name=env_name)
+            env = gym.make(env_id, env_name=env_name, max_episode_steps= int(1000/action_repeat))
         if action_repeat > 1:
             env = ActionRepeatWrapper(env, action_repeat)
         return env
@@ -599,7 +599,7 @@ if __name__=='__main__':
         if infos["success"][0] == 1:
                success_rate += 1  
         current_rate = success_rate/episode_count
-        print(f"ep= {episode_count} global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}, cumulative reward={cumulative_reward}, success_rate={current_rate}")
+        print(f"global_step={global_step}, episode_length={episode_len}, buffer_episodes={len(buffer)}, cumulative reward={cumulative_reward}, success_rate={current_rate}")
         writer.add_scalar("charts/episode_reward", cumulative_reward, global_step)
         writer.add_scalar("charts/episode_length", episode_len, global_step)
         writer.add_scalar("charts/success_rate", current_rate, global_step)
